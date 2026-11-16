@@ -14,9 +14,17 @@ if PUMPPORTAL_API_KEY:
 async def start_scanner():
     while True:
         try:
-            print("Hidaweb3 Scanner connecting to PumpPortal...")
+            print("Hidaweb3 connecting to PumpPortal...")
 
-            async with websockets.connect(URL) as ws:
+            async with websockets.connect(
+                URL,
+                open_timeout=20,
+                close_timeout=10,
+                ping_interval=20,
+                ping_timeout=20
+            ) as ws:
+
+                print("Hidaweb3 Scanner is now LIVE!")
 
                 await ws.send(json.dumps({
                     "method": "subscribeNewToken"
@@ -26,18 +34,15 @@ async def start_scanner():
                     "method": "subscribeMigration"
                 }))
 
-                print("Hidaweb3 Scanner is now LIVE!")
+                print("Subscriptions sent successfully.")
 
                 async for message in ws:
                     data = json.loads(message)
-
-                    print(
-                        "NEW TOKEN EVENT:",
-                        json.dumps(data)
-                    )
+                    print("PUMPPORTAL EVENT:")
+                    print(json.dumps(data, indent=2))
 
         except Exception as error:
-            print("Scanner connection error:", error)
+            print("SCANNER CONNECTION ERROR:", repr(error))
             print("Reconnecting in 10 seconds...")
             await asyncio.sleep(10)
 
