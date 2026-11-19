@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import time
+from datetime import datetime, timezone
 from urllib.parse import urlencode
 
 import requests
@@ -41,8 +42,72 @@ def fetch_dex_pairs(token_addresses):
     return payload if isinstance(payload, list) else []
 
 
+def build_qualified_payload(result, pair, token_address):
+    """Build a stable, Make.com-friendly event payload for a qualified token."""
+    base_token = pair.get("baseToken") or {}
+    quote_token = pair.get("quoteToken") or {}
+    if str(base_token.get("address", "")).lower() == token_address.lower():
+        token = base_token
+    elif str(quote_token.get("address", "")).lower() == token_address.lower():
+        token = quote_token
+    else:
+        token = {}
+
+    return {
+        "source": "Hidaweb3 AI Researcher",
+        "event": "token_qualified",
+        "event_id": f"solana:{token_address}:{result.get('pair_address') or 'no-pair'}",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "chain": "solana",
+        "token_name": token.get("name"),
+        "token_symbol": token.get("symbol"),
+        "token_address": token_address,
+        "market_cap_usd": result.get("market_cap_usd"),
+        "volume_24h_usd": result.get("volume_24h_usd"),
+        "liquidity_usd": result.get("liquidity_usd"),
+        "token_age_hours": result.get("age_hours"),
+        "pair_address": result.get("pair_address"),
+        "dex_id": result.get("dex_id"),
+        "dexscreener_url": result.get("pair_url"),
+        "filter_status": result.get("status"),
+        "filter_reason": result.get("reason"),
+    }
+
+
+def send_make_webhook(payload):
+    """Send a qualified-token event to the configured Make.com custom webhook."""
+    webhook_url = os.getenv("MAKE_WEBHOOK_URL")
+    if not webhook_url:
+        logger.error("Make.com delivery skipped: MAKE_WEBHOOK_URL is not configured")
+        return False
+
+    try:
+        response = requests.post(
+            webhook_url,
+            json=payload,
+            headers={
+                "Content-Type": "application/json",
+                "Idempotency-Key": str(payload.get("event_id", "")),
+            },
+            timeout=20,
+        )
+        response.raise_for_status()
+        logger.info(
+            "Make.com webhook delivered: event_id=%s status_code=%s",
+            payload.get("event_id"),
+            response.status_code,
+        )
+        return True
+    except requests.RequestException:
+        logger.exception(
+            "Make.com webhook delivery failed; qualified token will be retried: %s",
+            payload.get("token_address"),
+        )
+        return False
+
+
 async def monitor_candidates(candidates):
-    """Poll market data in batches and log tokens that pass all core filters."""
+    """Poll market data and forward tokens that pass all core filters to Make.com."""
     while True:
         await asyncio.sleep(POLL_INTERVAL_SECONDS)
         now = time.time()
@@ -90,7 +155,15 @@ async def monitor_candidates(candidates):
                         "HIDA_FILTER_QUALIFIED %s",
                         json.dumps(result, separators=(",", ":")),
                     )
-                    candidates.pop(address, None)
+                    payload = build_qualified_payload(result, best_pair, address)
+                    delivered = await asyncio.to_thread(send_make_webhook, payload)
+                    if delivered:
+                        candidates.pop(address, None)
+                    else:
+                        logger.warning(
+                            "Filter engine: qualified token remains queued for webhook retry: %s",
+                            address,
+                        )
                 elif result["status"] == "expired":
                     logger.info("Filter engine: candidate expired: %s", address)
                     candidates.pop(address, None)
@@ -143,15 +216,13 @@ async def start_scanner():
                         if not isinstance(data, dict):
                             continue
 
-                        # PumpPortal sends a create event with the token mint address.
                         if data.get("txType") == "create":
                             mint = data.get("mint")
                             if isinstance(mint, str) and mint:
                                 if mint not in candidates and len(candidates) < MAX_CANDIDATES:
                                     candidates[mint] = {"observed_at": time.time()}
                                     logger.info(
-                                        "Filter engine: new token candidate queued: %s "
-                                        "(%s/%s)",
+                                        "Filter engine: new token candidate queued: %s (%s/%s)",
                                         mint,
                                         len(candidates),
                                         MAX_CANDIDATES,
